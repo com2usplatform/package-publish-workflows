@@ -1,0 +1,9 @@
+# 게시용 Reusable Workflow Repository의 CODEOWNERS. 정책 11.4·11.2, 결정 18.
+#
+# 이 저장소의 Workflow를 바꿀 수 있는 주체는 레지스트리에 임의 패키지를 게시할 수 있는
+# 주체와 같다. config/rulesets/package-publish-workflows-main.json의 require_code_owner_review와
+# 짝이며 둘 중 하나만 있으면 통제가 성립하지 않는다.
+#
+# 소유자는 config/promote/approvers.yml의 devex·backup_owners와 같아야 한다. 소유자가
+# 한 명이면 자기 PR을 승인할 수 없어 Ruleset을 active로 둘 수 없다.
+*                       @comsy-gcp @sunmool-com2us
