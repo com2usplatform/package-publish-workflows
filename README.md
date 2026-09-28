@@ -10,4 +10,4 @@ Com2uS Platform 제품의 패키지 레지스트리 게시용 Reusable Workflow�
 
 | Workflow | 레지스트리 | 상태 |
 | --- | --- | --- |
-| `npm-publish.yml` | npm | 준비 중 |
+| `npm-publish.yml` | npm | 리허설 전 |

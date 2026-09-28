@@ -1,0 +1,374 @@
+# npm 게시용 Reusable Workflow. 정책 11.4의 게시용 Reusable Workflow Repository `package-publish-workflows`에 둔다.
+# 규범은 정책 11.4와 배포 정책 9.4다. 설계 기록·원본·테스트는 DevEx가 관리하는 내부 저장소에 있고, 이 파일은 그 원본과 같다.
+#
+# - 제품 코드를 실행하는 Job(build)에는 OIDC 권한이 없고, OIDC 권한이 있는 Job(publish)은 제품 코드를
+#   실행하지 않는다. build는 tarball의 내용을 바꿀 수 있으므로 publish가 tarball을 다시 검사한다.
+# - Secret과 인증정보를 이 저장소에 두지 않는다. 첫 게시 토큰은 호출한 Official Repository의
+#   `npm-publish` Environment Secret이다(배포 정책 9.4의 첫 게시 예외).
+# - 외부 Action은 전체 Commit SHA로 고정하고 Actions 캐시를 쓰지 않는다.
+# - 이 저장소에는 CI가 없다. 변경은 원본에서 테스트를 통과시킨 뒤 같은 내용으로 반영한다.
+name: npm-publish
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        description: 리허설용. true면 마지막 단계를 `npm publish --dry-run`으로 실행한다
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # npm 11.19.0 동봉. trusted publishing은 npm 11.5.1·Node 22.14.0 이상이 필요하다.
+  # npm 12는 의존성 lifecycle script를 기본 차단하므로 올릴 때 제품팀 운영 가이드와 함께 본다.
+  NODE_VERSION: "24.21.0"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      required_files: ${{ steps.extra.outputs.required_files }}
+      name: ${{ steps.extra.outputs.name }}
+      version: ${{ steps.extra.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # v7은 package.json의 packageManager가 npm이면 캐시를 자동으로 켠다. Run 사이에 섞이지 않게 끈다.
+          package-manager-cache: false
+      - id: manifest
+        name: manifest 검사
+        env:
+          MANIFEST: package.json
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          node <<'CHECK'
+          const fs = require("fs");
+          const fail = [];
+          const show = (v) => JSON.stringify(v === undefined ? null : v);
+          const m = JSON.parse(fs.readFileSync(process.env.MANIFEST, "utf8"));
+          const tag = process.env.TAG || "";
+          const repo = process.env.REPO || "";
+          if (!/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(tag)) {
+            fail.push(`Tag ${show(tag)}가 vMAJOR.MINOR.PATCH가 아니다 (배포 정책 7.2)`);
+          } else if (m.version !== tag.slice(1)) {
+            fail.push(`version ${show(m.version)}가 Tag ${show(tag)}와 다르다 (배포 정책 7.2)`);
+          }
+          if (typeof m.name !== "string" || !/^@com2usplatform\/[a-z0-9][a-z0-9._-]*$/.test(m.name)) {
+            fail.push(`name ${show(m.name)}가 @com2usplatform/ 이름 공간이 아니다 (배포 정책 6.1.1)`);
+          }
+          const pc = m.publishConfig || {};
+          const extraKeys = Object.keys(pc).filter((k) => !["access", "tag", "registry"].includes(k));
+          if (extraKeys.length) {
+            fail.push(`publishConfig에 허용하지 않는 키 ${show(extraKeys)}가 있다. 게시 시점의 npm 설정이므로 access·tag·registry만 둔다`);
+          }
+          if (pc.access !== "public") {
+            fail.push(`publishConfig.access ${show(pc.access)}가 public이 아니다 (배포 정책 9.4)`);
+          }
+          if (pc.tag !== undefined && pc.tag !== "latest") {
+            fail.push(`publishConfig.tag ${show(pc.tag)}가 latest가 아니다 (배포 정책 9.4)`);
+          }
+          if (pc.registry !== undefined && String(pc.registry).replace(/\/+$/, "") !== "https://registry.npmjs.org") {
+            fail.push(`publishConfig.registry ${show(pc.registry)}가 npm 공개 레지스트리가 아니다 (배포 정책 9.4)`);
+          }
+          if (m.license !== "Apache-2.0") {
+            fail.push(`license ${show(m.license)}가 Apache-2.0이 아니다 (정책 13)`);
+          }
+          const r = typeof m.repository === "string" ? m.repository : (m.repository && m.repository.url) || "";
+          if (String(r).replace(/^git\+/, "").replace(/\.git$/, "") !== `https://github.com/${repo}`) {
+            fail.push(`repository ${show(r)}가 게시하는 저장소 https://github.com/${repo} 와 다르다 (provenance 요건)`);
+          }
+          if (fail.length) {
+            for (const f of fail) console.log(`::error::${f}`);
+            process.exit(1);
+          }
+          console.log(`manifest 검사 통과: ${m.name}@${m.version}`);
+          CHECK
+      - id: extra
+        name: 게시 대상 파일과 레지스트리 상태
+        run: |
+          node <<'EXTRA'
+          const fs = require("fs");
+          const crypto = require("crypto");
+          const m = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const fail = [];
+          if (!Array.isArray(m.files) || m.files.length === 0) fail.push("files가 없다. 게시 대상을 files로 지정한다 (배포 정책 9.4)");
+          if (fs.existsSync(".npmignore")) fail.push(".npmignore가 있다. 제외 목록 방식을 쓰지 않는다 (배포 정책 9.4)");
+          const candidates = ["LICENSE", "LICENSE.md", "LICENSE.txt", "NOTICE", "NOTICE.md", "NOTICE.txt"];
+          const required = candidates.filter((f) => fs.existsSync(f) && fs.lstatSync(f).isFile());
+          if (!required.some((f) => f.startsWith("LICENSE"))) fail.push("루트에 LICENSE가 없다 (정책 13)");
+          if (fail.length) {
+            for (const f of fail) console.log(`::error::${f}`);
+            process.exit(1);
+          }
+          // 이름과 함께 원본의 SHA-256을 넘긴다. publish가 tarball의 파일과 내용까지 대조한다.
+          const spec = required.map((f) => `${f}=${crypto.createHash("sha256").update(fs.readFileSync(f)).digest("hex")}`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `required_files=${spec.join(" ")}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `name=${m.name}\nversion=${m.version}\n`);
+          console.log(`게시 산출물 필수 파일 (배포 정책 7.4): ${required.join(", ")}`);
+          EXTRA
+      - name: 같은 버전이 이미 게시됐는지
+        env:
+          NAME: ${{ steps.extra.outputs.name }}
+          VERSION: ${{ steps.extra.outputs.version }}
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${NAME/\//%2F}/${VERSION}")
+          case "$status" in
+            404) echo "레지스트리에 ${NAME}@${VERSION}이 없다" ;;
+            200) echo "::error::${NAME}@${VERSION}은 이미 게시됐다. 버전 번호를 다시 쓰지 않는다 (배포 정책 7.2)"; exit 1 ;;
+            *) echo "::error::레지스트리 조회가 실패했다 (HTTP ${status})"; exit 1 ;;
+          esac
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tarball: ${{ steps.pack.outputs.tarball }}
+      sha256: ${{ steps.pack.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # v7은 package.json의 packageManager가 npm이면 캐시를 자동으로 켠다. Run 사이에 섞이지 않게 끈다.
+          package-manager-cache: false
+      # 의존성 설치 script와 제품 빌드는 이 Job에서만 돈다. 이 Job에는 게시 권한이 없다.
+      - run: npm ci --no-audit --no-fund
+      # npm pack은 prepublishOnly를 실행하지 않는다. 빌드는 build 스크립트에 둔다(운영 가이드 요건).
+      - run: npm run build --if-present
+      - id: pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/pack"
+          # lifecycle script의 stdout이 JSON에 섞이지 않게 한다. script는 그대로 돈다.
+          npm pack --pack-destination "$RUNNER_TEMP/pack" --json --foreground-scripts=false > "$RUNNER_TEMP/pack.json"
+          tarball=$(node -e 'const p=require(process.argv[1]); if (p.length !== 1) process.exit(1); console.log(p[0].filename)' "$RUNNER_TEMP/pack.json")
+          sha=$(sha256sum "$RUNNER_TEMP/pack/$tarball" | cut -d' ' -f1)
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "$tarball sha256=$sha"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-tarball
+          path: ${{ runner.temp }}/pack/${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # 제품 코드를 checkout하지 않는다. build가 넘긴 tarball만 다룬다.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          # v7은 package.json의 packageManager가 npm이면 캐시를 자동으로 켠다. Run 사이에 섞이지 않게 끈다.
+          package-manager-cache: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-tarball
+          path: ${{ runner.temp }}/in
+      # build를 신뢰하지 않는다. build가 넘긴 파일명을 쓰지 않고 내려받은 것을 직접 본다.
+      - id: unpack
+        name: tarball 확인과 manifest 추출
+        env:
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          shopt -s nullglob dotglob
+          found=("$RUNNER_TEMP"/in/*)
+          if [ "${#found[@]}" -ne 1 ] || [ -L "${found[0]}" ] || [ ! -f "${found[0]}" ] || [[ "${found[0]}" != *.tgz ]]; then
+            echo "::error::내려받은 Artifact에는 .tgz 파일이 정확히 하나 있어야 한다"
+            exit 1
+          fi
+          file="${found[0]}"
+          echo "$SHA256  $file" | sha256sum -c -
+          tar -tvzf "$file" > "$RUNNER_TEMP/listing.txt"
+          tar -tzf "$file" > "$RUNNER_TEMP/contents.txt"
+          # 엔트리는 package/ 아래의 정규 경로에 있는 일반 파일이나 디렉터리여야 한다. npm은 경로를
+          # 정규화하므로 `package/./package.json` 같은 이름이 package/package.json을 덮어쓴다.
+          # 링크·비정규 경로·중복을 막아 여기서 검사한 package.json과 npm이 읽는 것을 같게 한다.
+          # 파이프 끝에 grep -q를 두지 않는다 — pipefail에서 SIGPIPE로 탐지를 놓칠 수 있다.
+          links=$(cut -c1 "$RUNNER_TEMP/listing.txt" | grep -cv '^[-d]$' || true)
+          if [ "$links" != "0" ]; then
+            echo "::error::tarball에 일반 파일·디렉터리가 아닌 엔트리가 있다"
+            exit 1
+          fi
+          outside=$(grep -cEv '^package(/[^/]+)*/?$' "$RUNNER_TEMP/contents.txt" || true)
+          dots=$(grep -cE '(^|/)\.\.?(/|$)' "$RUNNER_TEMP/contents.txt" || true)
+          if [ "$outside" != "0" ] || [ "$dots" != "0" ]; then
+            echo "::error::tarball에 package/ 아래의 정규 경로가 아닌 엔트리가 있다"
+            exit 1
+          fi
+          dups=$(sort "$RUNNER_TEMP/contents.txt" | uniq -d | wc -l | tr -d ' ')
+          if [ "$dups" != "0" ]; then
+            echo "::error::tarball에 중복 엔트리가 있다"
+            exit 1
+          fi
+          if [ "$(grep -cx 'package/package.json' "$RUNNER_TEMP/contents.txt")" != "1" ]; then
+            echo "::error::tarball에 package/package.json이 하나 있어야 한다"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/manifest"
+          tar -xzf "$file" -C "$RUNNER_TEMP/manifest" package/package.json
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+      # verify와 같은 코드다. build가 package.json을 바꿨다면 여기서 걸린다.
+      - id: manifest
+        name: manifest 검사
+        env:
+          MANIFEST: ${{ runner.temp }}/manifest/package/package.json
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          node <<'CHECK'
+          const fs = require("fs");
+          const fail = [];
+          const show = (v) => JSON.stringify(v === undefined ? null : v);
+          const m = JSON.parse(fs.readFileSync(process.env.MANIFEST, "utf8"));
+          const tag = process.env.TAG || "";
+          const repo = process.env.REPO || "";
+          if (!/^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(tag)) {
+            fail.push(`Tag ${show(tag)}가 vMAJOR.MINOR.PATCH가 아니다 (배포 정책 7.2)`);
+          } else if (m.version !== tag.slice(1)) {
+            fail.push(`version ${show(m.version)}가 Tag ${show(tag)}와 다르다 (배포 정책 7.2)`);
+          }
+          if (typeof m.name !== "string" || !/^@com2usplatform\/[a-z0-9][a-z0-9._-]*$/.test(m.name)) {
+            fail.push(`name ${show(m.name)}가 @com2usplatform/ 이름 공간이 아니다 (배포 정책 6.1.1)`);
+          }
+          const pc = m.publishConfig || {};
+          const extraKeys = Object.keys(pc).filter((k) => !["access", "tag", "registry"].includes(k));
+          if (extraKeys.length) {
+            fail.push(`publishConfig에 허용하지 않는 키 ${show(extraKeys)}가 있다. 게시 시점의 npm 설정이므로 access·tag·registry만 둔다`);
+          }
+          if (pc.access !== "public") {
+            fail.push(`publishConfig.access ${show(pc.access)}가 public이 아니다 (배포 정책 9.4)`);
+          }
+          if (pc.tag !== undefined && pc.tag !== "latest") {
+            fail.push(`publishConfig.tag ${show(pc.tag)}가 latest가 아니다 (배포 정책 9.4)`);
+          }
+          if (pc.registry !== undefined && String(pc.registry).replace(/\/+$/, "") !== "https://registry.npmjs.org") {
+            fail.push(`publishConfig.registry ${show(pc.registry)}가 npm 공개 레지스트리가 아니다 (배포 정책 9.4)`);
+          }
+          if (m.license !== "Apache-2.0") {
+            fail.push(`license ${show(m.license)}가 Apache-2.0이 아니다 (정책 13)`);
+          }
+          const r = typeof m.repository === "string" ? m.repository : (m.repository && m.repository.url) || "";
+          if (String(r).replace(/^git\+/, "").replace(/\.git$/, "") !== `https://github.com/${repo}`) {
+            fail.push(`repository ${show(r)}가 게시하는 저장소 https://github.com/${repo} 와 다르다 (provenance 요건)`);
+          }
+          if (fail.length) {
+            for (const f of fail) console.log(`::error::${f}`);
+            process.exit(1);
+          }
+          console.log(`manifest 검사 통과: ${m.name}@${m.version}`);
+          CHECK
+      # 부트스트랩 토큰은 Scope 전체 권한이다. build가 name을 바꾸면 다른 패키지에 게시된다.
+      - id: identity
+        name: 원본과 같은 패키지인지
+        env:
+          EXPECT_NAME: ${{ needs.verify.outputs.name }}
+          EXPECT_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          node - "$RUNNER_TEMP/manifest/package/package.json" <<'IDENTITY'
+          const m = JSON.parse(require("fs").readFileSync(process.argv[2], "utf8"));
+          if (m.name !== process.env.EXPECT_NAME || m.version !== process.env.EXPECT_VERSION) {
+            console.log(`::error::tarball의 ${JSON.stringify(m.name)}@${JSON.stringify(m.version)}가 원본 ${process.env.EXPECT_NAME}@${process.env.EXPECT_VERSION}와 다르다`);
+            process.exit(1);
+          }
+          console.log(`원본과 같은 패키지: ${m.name}@${m.version}`);
+          IDENTITY
+      - id: files
+        name: 필수 파일이 원본과 같은지 (배포 정책 7.4)
+        env:
+          FILE: ${{ steps.unpack.outputs.file }}
+          REQUIRED: ${{ needs.verify.outputs.required_files }}
+        run: |
+          # build는 prepack에서 LICENSE·NOTICE를 비우거나 바꿀 수 있다. 이름이 아니라 내용을 대조한다.
+          mkdir -p "$RUNNER_TEMP/required"
+          missing=0
+          for entry in $REQUIRED; do
+            name="${entry%%=*}"
+            expected="${entry#*=}"
+            if ! tar -xzf "$FILE" -C "$RUNNER_TEMP/required" "package/$name" 2>/dev/null; then
+              echo "::error::tarball에 $name가 없다. files에 포함한다 (배포 정책 7.4)"
+              missing=1
+              continue
+            fi
+            actual=$(sha256sum "$RUNNER_TEMP/required/package/$name" | cut -d' ' -f1)
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::tarball의 $name가 원본과 다르다 (배포 정책 7.4)"
+              missing=1
+            fi
+          done
+          exit "$missing"
+      - id: registry
+        name: 레지스트리에 패키지가 있는지
+        run: |
+          name=$(node -p 'require(process.argv[1]).name' "$RUNNER_TEMP/manifest/package/package.json")
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${name/\//%2F}")
+          case "$status" in
+            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::레지스트리 조회가 실패했다 (HTTP ${status})"; exit 1 ;;
+          esac
+      # 「첫 게시」 판정표. 조회와 분리해 판정만 한다.
+      - id: auth
+        name: 인증 방식 판정
+        env:
+          BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
+          EXISTS: ${{ steps.registry.outputs.exists }}
+        run: |
+          if [ "$EXISTS" != "true" ] && [ "$EXISTS" != "false" ]; then
+            echo "::error::레지스트리 상태를 알 수 없다"
+            exit 1
+          fi
+          if [ -n "$BOOTSTRAP_TOKEN" ] && [ "$EXISTS" = "true" ]; then
+            echo "::error::패키지가 이미 있는데 부트스트랩 토큰이 남아 있다. 토큰을 폐기하고 npm-publish Environment Secret을 지운다 (배포 정책 9.4)"
+            exit 1
+          fi
+          if [ -z "$BOOTSTRAP_TOKEN" ] && [ "$EXISTS" = "false" ]; then
+            echo "::error::첫 게시다. 부트스트랩 토큰이 필요하다 (배포 정책 9.4)"
+            exit 1
+          fi
+          if [ -n "$BOOTSTRAP_TOKEN" ]; then
+            umask 077
+            printf '//registry.npmjs.org/:_authToken=%s\n' "$BOOTSTRAP_TOKEN" > "$RUNNER_TEMP/bootstrap.npmrc"
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "첫 게시: 부트스트랩 토큰으로 인증한다"
+          else
+            echo "mode=oidc" >> "$GITHUB_OUTPUT"
+            echo "신뢰 게시(OIDC)로 인증한다"
+          fi
+      - id: publish
+        name: 게시
+        env:
+          FILE: ${{ steps.unpack.outputs.file }}
+          MODE: ${{ steps.auth.outputs.mode }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$MODE" = "bootstrap" ]; then
+            export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/bootstrap.npmrc"
+          fi
+          dry=""
+          if [ "$DRY_RUN" = "true" ]; then dry="--dry-run"; fi
+          # --tag를 주지 않는다. 명시하면 npm이 더 높은 버전이 있을 때 latest를 옮기지 않는 가드를 끈다.
+          # dist-tag는 manifest 검사가 publishConfig.tag를 latest로 묶는다(배포 정책 9.4).
+          npm publish "$FILE" --provenance --access public --ignore-scripts $dry
