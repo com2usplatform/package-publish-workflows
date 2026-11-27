@@ -13,7 +13,7 @@ on:
   workflow_call:
     inputs:
       dry_run:
-        description: 리허설용. true면 마지막 단계를 `npm publish --dry-run`으로 실행한다
+        description: 리허설용. true면 `npm stage publish` 또는 `npm publish`를 `--dry-run`으로 실행한다
         type: boolean
         default: false
 
@@ -79,6 +79,9 @@ jobs:
           }
           if (pc.tag !== undefined && pc.tag !== "latest") {
             fail.push(`publishConfig.tag ${show(pc.tag)}가 latest가 아니다 (배포 정책 9.4)`);
+          }
+          if (m.tag !== undefined && m.tag !== "latest") {
+            fail.push(`package.json의 tag ${show(m.tag)}가 latest가 아니다 (배포 정책 9.4)`);
           }
           if (pc.registry !== undefined && String(pc.registry).replace(/\/+$/, "") !== "https://registry.npmjs.org") {
             fail.push(`publishConfig.registry ${show(pc.registry)}가 npm 공개 레지스트리가 아니다 (배포 정책 9.4)`);
@@ -225,6 +228,10 @@ jobs:
     needs: [verify, build]
     runs-on: ubuntu-latest
     environment: npm-publish
+    # 같은 저장소의 다른 Tag가 승인 대기를 조회하고 제출하는 사이에 끼어들지 않게 한다.
+    concurrency:
+      group: npm-registry-${{ github.repository }}
+      queue: max
     permissions:
       contents: read
       id-token: write
@@ -316,6 +323,9 @@ jobs:
           if (pc.tag !== undefined && pc.tag !== "latest") {
             fail.push(`publishConfig.tag ${show(pc.tag)}가 latest가 아니다 (배포 정책 9.4)`);
           }
+          if (m.tag !== undefined && m.tag !== "latest") {
+            fail.push(`package.json의 tag ${show(m.tag)}가 latest가 아니다 (배포 정책 9.4)`);
+          }
           if (pc.registry !== undefined && String(pc.registry).replace(/\/+$/, "") !== "https://registry.npmjs.org") {
             fail.push(`publishConfig.registry ${show(pc.registry)}가 npm 공개 레지스트리가 아니다 (배포 정책 9.4)`);
           }
@@ -372,43 +382,92 @@ jobs:
           done
           exit "$missing"
       - id: registry
-        name: 레지스트리에 패키지가 있는지
+        name: npm에 실제 게시된 버전이 있는지
+        env:
+          NAME: ${{ needs.verify.outputs.name }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          name=$(node -p 'require(process.argv[1]).name' "$RUNNER_TEMP/manifest/package/package.json")
-          status=$(curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/${name/\//%2F}")
-          case "$status" in
-            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
-            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
-            *) echo "::error::레지스트리 조회가 실패했다 (HTTP ${status})"; exit 1 ;;
-          esac
+          node <<'REGISTRY'
+          const fs = require("node:fs");
+          const { NAME, VERSION, GITHUB_OUTPUT } = process.env;
+          const placeholder = "0.0.0-stage";
+          async function registryState() {
+            const response = await fetch(`https://registry.npmjs.org/${encodeURIComponent(NAME)}`, {
+              headers: { Accept: "application/vnd.npm.install-v1+json", "Cache-Control": "no-cache" },
+              redirect: "error",
+              signal: AbortSignal.timeout(30000),
+            });
+            if (response.status === 404) return "first";
+            if (response.status !== 200) throw new Error(`레지스트리 조회 실패 (HTTP ${response.status})`);
+            const { name, versions } = await response.json();
+            if (name !== NAME || !versions || typeof versions !== "object" || Array.isArray(versions) ||
+                Object.keys(versions).length === 0) {
+              throw new Error("레지스트리 패키지 또는 버전 목록이 올바르지 않다");
+            }
+            if (Object.hasOwn(versions, VERSION)) throw new Error("이 버전은 이미 게시됐다");
+            return Object.keys(versions).some(version => version !== placeholder) ? "published" : "first";
+          }
+          registryState().then(state => fs.appendFileSync(GITHUB_OUTPUT, `state=${state}\n`)).catch(error => {
+            console.error(`::error::${error.message}`);
+            process.exitCode = 1;
+          });
+          REGISTRY
       # 「첫 게시」 판정표. 조회와 분리해 판정만 한다.
       - id: auth
         name: 인증 방식 판정
         env:
           BOOTSTRAP_TOKEN: ${{ secrets.NPM_BOOTSTRAP_TOKEN }}
-          EXISTS: ${{ steps.registry.outputs.exists }}
+          REGISTRY_STATE: ${{ steps.registry.outputs.state }}
         run: |
-          if [ "$EXISTS" != "true" ] && [ "$EXISTS" != "false" ]; then
-            echo "::error::레지스트리 상태를 알 수 없다"
-            exit 1
-          fi
-          if [ -n "$BOOTSTRAP_TOKEN" ] && [ "$EXISTS" = "true" ]; then
-            echo "::error::패키지가 이미 있는데 부트스트랩 토큰이 남아 있다. 토큰을 폐기하고 npm-publish Environment Secret을 지운다 (배포 정책 9.4)"
-            exit 1
-          fi
-          if [ -z "$BOOTSTRAP_TOKEN" ] && [ "$EXISTS" = "false" ]; then
-            echo "::error::첫 게시다. 부트스트랩 토큰이 필요하다 (배포 정책 9.4)"
-            exit 1
-          fi
-          if [ -n "$BOOTSTRAP_TOKEN" ]; then
-            umask 077
-            printf '//registry.npmjs.org/:_authToken=%s\n' "$BOOTSTRAP_TOKEN" > "$RUNNER_TEMP/bootstrap.npmrc"
-            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
-            echo "첫 게시: 부트스트랩 토큰으로 인증한다"
-          else
-            echo "mode=oidc" >> "$GITHUB_OUTPUT"
-            echo "신뢰 게시(OIDC)로 인증한다"
-          fi
+          case "$REGISTRY_STATE" in
+            first)
+              if [ -z "$BOOTSTRAP_TOKEN" ]; then
+                echo "::error::첫 게시에는 stage 전용 부트스트랩 토큰이 필요하다. 이미 제출했다면 npm Staged Packages에서 승인을 확인한다 (배포 정책 9.4)"
+                exit 1
+              fi
+              umask 077
+              printf '//registry.npmjs.org/:_authToken=%s\n' "$BOOTSTRAP_TOKEN" > "$RUNNER_TEMP/bootstrap.npmrc"
+              echo "mode=stage" >> "$GITHUB_OUTPUT"
+              ;;
+            published)
+              if [ -n "$BOOTSTRAP_TOKEN" ]; then
+                echo "::error::이미 게시된 버전이 있다. 부트스트랩 토큰을 폐기하고 npm-publish Environment Secret을 지운다 (배포 정책 9.4)"
+                exit 1
+              fi
+              echo "mode=oidc" >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo "::error::레지스트리 상태를 알 수 없다"; exit 1 ;;
+          esac
+      - id: stage-queue
+        if: steps.auth.outputs.mode == 'stage' && !inputs.dry_run
+        name: 첫 게시 승인 대기 확인
+        env:
+          NAME: ${{ needs.verify.outputs.name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          FILE: ${{ steps.unpack.outputs.file }}
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/bootstrap.npmrc
+        run: |
+          npm stage list "$NAME" --registry=https://registry.npmjs.org/ --fetch-retries=0 --fetch-timeout=20000 --json > "$RUNNER_TEMP/npm-stage-list.json"
+          node <<'STAGE_QUEUE'
+          const fs = require("node:fs");
+          const crypto = require("node:crypto");
+          const { NAME, VERSION, FILE, RUNNER_TEMP, GITHUB_OUTPUT } = process.env;
+          const entries = JSON.parse(fs.readFileSync(`${RUNNER_TEMP}/npm-stage-list.json`, "utf8"));
+          if (!Array.isArray(entries)) throw new Error("npm 승인 대기 목록 응답이 올바르지 않다");
+          if (entries.length === 0) {
+            fs.appendFileSync(GITHUB_OUTPUT, "pending=false\n");
+          } else {
+            const [entry] = entries;
+            const shasum = crypto.createHash("sha1").update(fs.readFileSync(FILE)).digest("hex");
+            if (entries.length !== 1 || !entry || entry.packageName !== NAME || entry.version !== VERSION ||
+                entry.tag !== "latest" || (entry.access !== undefined && entry.access !== "public") || entry.shasum !== shasum ||
+                typeof entry.id !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(entry.id)) {
+              throw new Error("이미 다른 제출이 승인 대기 중이다. npm Staged Packages에서 확인한다");
+            }
+            fs.appendFileSync(GITHUB_OUTPUT, "pending=true\n");
+            console.log(`::notice::이미 제출된 Stage ID ${entry.id}. 제출 Run과 tarball을 대조한 뒤 npm에서 승인한다`);
+          }
+          STAGE_QUEUE
       # 배포 정책 5.1 — Release 본문에 npm 미게시로 기록된 버전은 게시하지 않는다. 기록한 뒤 누가 이 Run을 다시
       # 실행해도 게시되지 않게 한다. verify와 publish가 같은 스크립트를 쓴다. Release가 아직 없으면(404) 통과한다 —
       # Release는 Tag를 만든 뒤에 생긴다. 그 밖의 조회 실패·리다이렉트·30초 초과는 게시하지 않는다.
@@ -467,12 +526,26 @@ jobs:
           FILE: ${{ steps.unpack.outputs.file }}
           MODE: ${{ steps.auth.outputs.mode }}
           DRY_RUN: ${{ inputs.dry_run }}
+          PENDING: ${{ steps.stage-queue.outputs.pending }}
         run: |
-          if [ "$MODE" = "bootstrap" ]; then
-            export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/bootstrap.npmrc"
-          fi
-          dry=""
-          if [ "$DRY_RUN" = "true" ]; then dry="--dry-run"; fi
+          dry=()
+          if [ "$DRY_RUN" = "true" ]; then dry=(--dry-run); fi
           # --tag를 주지 않는다. 명시하면 npm이 더 높은 버전이 있을 때 latest를 옮기지 않는 가드를 끈다.
-          # dist-tag는 manifest 검사가 publishConfig.tag를 latest로 묶는다(배포 정책 9.4).
-          npm publish "$FILE" --provenance --access public --ignore-scripts $dry
+          # dist-tag는 manifest 검사가 tag와 publishConfig.tag를 latest로 묶는다(배포 정책 9.4).
+          case "$MODE" in
+            stage)
+              if [ "$DRY_RUN" != "true" ] && [[ "$PENDING" != "true" && "$PENDING" != "false" ]]; then
+                echo "::error::npm 승인 대기 상태를 확인하지 못했다"
+                exit 1
+              fi
+              sha256sum "$FILE"
+              if [ "$PENDING" = "true" ]; then exit 0; fi
+              export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/bootstrap.npmrc"
+              npm stage publish "$FILE" --provenance --access public --ignore-scripts --json "${dry[@]}"
+              if [ "$DRY_RUN" != "true" ]; then
+                echo "::notice::npm stage 제출 완료. npm Staged Packages에서 검증이 끝난 뒤 2단계 인증으로 승인한다"
+              fi
+              ;;
+            oidc) npm publish "$FILE" --provenance --access public --ignore-scripts "${dry[@]}" ;;
+            *) echo "::error::게시 방식을 확인하지 못했다"; exit 1 ;;
+          esac
